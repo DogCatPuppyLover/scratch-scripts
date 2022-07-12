@@ -1,92 +1,124 @@
 import requests
-import re
-import time
-import json
-import math
+from time import sleep
+from getpass import getpass
 
-# Get user info
-print("Enter your username:")
-username = input()
+def prepare_session(username: str, password: str) -> requests.Session:
+    # Reference: https://github.com/yuwex/scratchcloud/blob/main/scratchcloud/client.py#L362
 
-print("Enter your password:")
-password = input()
-
-print("Should comments be enabled? Y/n")
-comments_on_yn = input()
-
-if comments_on_yn == "y":
-    comments_on = True
-else:
-    comments_on = False
-
-with requests.Session() as s:
-
-    # https://github.com/CubeyTheCube/scratchclient/tree/main/scratchclient
+    # Cookie header isn't needed
     headers = {
-        "x-csrftoken": "a",
-        "x-requested-with": "XMLHttpRequest",
-        "Cookie": "scratchcsrftoken=a;scratchlanguage=en;",
-        "referer": "https://scratch.mit.edu",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.101 Safari/537.36"
-    }
-    data = json.dumps({"username": username,"password": password,"useMessages": "true"})
-
-    # Login with user info
-    r = s.post("https://scratch.mit.edu/login/", data=data, headers=headers)
-    print(r.status_code)
-    session_id = re.search('"(.*)"', r.headers["Set-Cookie"]).group()
-    token = r.json()[0]["token"]
-
-    # Set headers
-    headers = {
-            "x-requested-with": "XMLHttpRequest",
-            "Cookie": "scratchlanguage=en;permissions=%7B%7D;",
-            "referer": "https://scratch.mit.edu"
+        "X-CSRFToken": "None",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://scratch.mit.edu",
+        "User-Agent": "commentlock",
     }
 
-    # Get CSRF token
-    r = s.get("https://scratch.mit.edu/csrf_token/", headers=headers)
-    print(r.status_code)
-    csrf_token = re.search(
-            "scratchcsrftoken=(.*?);", r.headers["Set-Cookie"]
-    ).group(1)
+    # Create session
+    session = requests.Session()
+    session.headers = headers
 
-    # Update headers with the CSRF token, token, and cookies
+    # Get CSRF first instead of making one up. This is a best practice.
+    resp = session.get("https://scratch.mit.edu/csrf_token/", headers=headers)
 
-    headers = {
-        "x-csrftoken": csrf_token,
-        "X-Token": token,
-        "x-requested-with": "XMLHttpRequest",
-        "Cookie": "scratchcsrftoken="
-        + csrf_token
-        + ";scratchlanguage=en;scratchsessionsid="
-        + session_id
-        + ";",
-        "referer": "https://scratch.mit.edu",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.101 Safari/537.36"
+    # Use built in resp.cookies.get() instead of regex.
+    csrf_token = resp.cookies.get("scratchcsrftoken")
+
+    # Update headers to include real CSRF
+    session.headers["X-CSRFToken"] = csrf_token
+
+    # Prepare login payload
+    payload = {
+        "username": username,
+        "password": password,
     }
 
-    print(csrf_token)
+    # Log in with CSRF Token.
+    resp = session.post(
+        "https://scratch.mit.edu/login/",
+        json=payload,
+    )
 
-    # Get session data
-    session = s.get("https://scratch.mit.edu/session/", headers=headers)
-    print(session.status_code)
-    print(session.text)
-    
+    # Update headers to include auth token.
+    token = resp.json()[0]["token"]
+    session.headers["X-Token"] = token
+
+    code = resp.status_code
+
+    if code == 200:
+        return session
+    else:
+        raise ConnectionError(
+            f"Got status code {code}. Maybe you entered invalid login information?"
+        )
+
+def set_comments_allowed(
+    session: requests.Session,
+    username: str,
+    comments_allowed: bool,
+    cooldown: float = 0.1,
+):
+
     offset = 0
-    
-    projects = {}
-    
-    while(len(projects) == 20 or offset == 0):
-        print("Page:" + str(math.floor(offset/20) + 1))
-    
-        projects_api = s.get("https://api.scratch.mit.edu/users/" + username + "/projects/?offset=" + str(offset), headers=headers)
-        
-        projects = json.loads(projects_api.text)
-        
-        for i in projects:
-            r = s.put("https://api.scratch.mit.edu/projects/" + str(i["id"]) + "/", headers=headers, json={"comments_allowed": comments_on})
-            print("https://api.scratch.mit.edu/projects/" + str(i["id"]))
-            print(r.status_code)
-    
+    projects = []
+
+    # Set up payload only once
+    payload = {"comments_allowed": comments_allowed}
+
+    while len(projects) == 20 or offset == 0:
+
+        # Use python integer division and f-strings to condense
+        print(f"Page: {offset // 20 + 1}")
+
+        # Use response.json() to get data immediately
+        projects = session.get(
+            f"https://api.scratch.mit.edu/users/{username}/projects/?offset={offset}"
+        ).json()
+
+        for project in projects:
+            # More f-strings :)
+            resp = session.put(
+                f"https://api.scratch.mit.edu/projects/{project['id']}/", json=payload
+            )
+
+            # Print out project title as well as id with some nice formatting.
+            success_text = (
+                "Success!"
+                if resp.status_code == 200
+                else f"Failed with code {resp.status_code}"
+            )
+            print(f"   {project['title']} [{project['id']}] - {success_text}")
+
+            # Use sleep to prevent ratelimiting / bans :D
+            sleep(cooldown)
+
         offset += 20
+
+
+# Use __name__ == '__main__' to prevent accidental running
+if __name__ == "__main__":
+
+    print("Welcome to the commentlock tool!")
+
+    username = input("Enter your username: ")
+    password = getpass("Enter your password: ")
+
+    # Make comments_on variable into 1-line
+    comments_on = input("Should comments be enabled? Y/n: ").lower() == "y"
+
+    # Add cooldown
+    cooldown = float(
+        input("How long should the request cooldown be? (0.1 recommended): ")
+    )
+
+    print("\n")
+
+    print("Logging in...")
+
+    # Use functions to break up code
+    session = prepare_session(username, password)
+
+    print("Setting project status...")
+
+    set_comments_allowed(session, username, comments_on, cooldown)
+
+    session.close()
